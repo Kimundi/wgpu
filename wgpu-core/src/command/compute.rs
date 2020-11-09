@@ -134,9 +134,9 @@ pub enum ComputePassError {
     MissingBufferUsage(#[from] MissingBufferUsageError),
     #[error("cannot pop debug group, because number of pushed debug groups is zero")]
     InvalidPopDebugGroup,
-    #[error(transparent)]
+    #[error("In a dispatch command")]
     Dispatch(#[from] DispatchError),
-    #[error(transparent)]
+    #[error("In a set_bind_group command")]
     Bind(#[from] BindError),
     #[error(transparent)]
     PushConstants(#[from] PushConstantUploadError),

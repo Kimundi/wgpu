@@ -663,7 +663,7 @@ pub enum RenderBundleError {
     RenderCommand(#[from] RenderCommandError),
     #[error(transparent)]
     ResourceUsageConflict(#[from] UsageConflict),
-    #[error(transparent)]
+    #[error("In a draw command")]
     Draw(#[from] DrawError),
 }
 

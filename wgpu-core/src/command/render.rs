@@ -374,9 +374,9 @@ pub enum RenderPassError {
     IncompatibleRenderBundle(#[from] RenderPassCompatibilityError),
     #[error(transparent)]
     RenderCommand(#[from] RenderCommandError),
-    #[error(transparent)]
+    #[error("In a draw command")]
     Draw(#[from] DrawError),
-    #[error(transparent)]
+    #[error("In a set_bind_group command")]
     Bind(#[from] BindError),
 }
 

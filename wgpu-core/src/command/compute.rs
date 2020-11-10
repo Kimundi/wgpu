@@ -116,8 +116,9 @@ pub enum DispatchError {
     },
 }
 
+/// Error encountered when performing a compute pass.
 #[derive(Clone, Debug, Error)]
-pub enum ComputePassError {
+pub enum ComputePassErrorInner {
     #[error(transparent)]
     Encoder(#[from] CommandEncoderError),
     #[error("bind group {0:?} is invalid")]
@@ -134,12 +135,37 @@ pub enum ComputePassError {
     MissingBufferUsage(#[from] MissingBufferUsageError),
     #[error("cannot pop debug group, because number of pushed debug groups is zero")]
     InvalidPopDebugGroup,
-    #[error("In a dispatch command")]
+    #[error(transparent)]
     Dispatch(#[from] DispatchError),
-    #[error("In a set_bind_group command")]
+    #[error(transparent)]
     Bind(#[from] BindError),
     #[error(transparent)]
     PushConstants(#[from] PushConstantUploadError),
+}
+
+/// Error encountered when performing a compute pass.
+#[derive(Clone, Debug, Error)]
+pub enum ComputePassError {
+    #[error(transparent)]
+    Inner(#[from] ComputePassErrorInner),
+
+    #[error("In a set_bind_group command")]
+    SetBindGroup(#[source] ComputePassErrorInner),
+    #[error("In a set_pipeline command")]
+    SetPipeline(#[source] ComputePassErrorInner),
+    #[error("In a set_push_constant command")]
+    SetPushConstant(#[source] ComputePassErrorInner),
+    #[error("In a dispatch command")]
+    Dispatch(#[source] ComputePassErrorInner),
+    #[error("In a indirect dispatch command")]
+    DispatchIndirect(#[source] ComputePassErrorInner),
+}
+
+fn with<T>(
+    ctx: impl FnOnce(ComputePassErrorInner) -> ComputePassError,
+    f: impl FnOnce() -> Result<T, ComputePassErrorInner>,
+) -> Result<T, ComputePassError> {
+    f().map_err(ctx)
 }
 
 #[derive(Debug)]
@@ -215,7 +241,10 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let mut token = Token::root();
 
         let (mut cmd_buf_guard, mut token) = hub.command_buffers.write(&mut token);
-        let cmd_buf = CommandBuffer::get_encoder(&mut *cmd_buf_guard, encoder_id)?;
+        let cmd_buf = CommandBuffer::get_encoder(&mut *cmd_buf_guard, encoder_id)
+            .map_err(ComputePassErrorInner::from)?;
+        let cmd_buf_limits = &mut cmd_buf.limits;
+        let cmd_buf_trackers = &mut cmd_buf.trackers;
         let raw = cmd_buf.raw.last_mut().unwrap();
 
         #[cfg(feature = "trace")]
@@ -233,7 +262,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let (texture_guard, _) = hub.textures.read(&mut token);
 
         let mut state = State {
-            binder: Binder::new(cmd_buf.limits.max_bind_groups),
+            binder: Binder::new(cmd_buf_limits.max_bind_groups),
             pipeline: StateChange::new(),
             trackers: TrackerSet::new(B::VARIANT),
             debug_scope_depth: 0,
@@ -246,10 +275,10 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     index,
                     num_dynamic_offsets,
                     bind_group_id,
-                } => {
-                    let max_bind_groups = cmd_buf.limits.max_bind_groups;
+                } => with(ComputePassError::SetBindGroup, || {
+                    let max_bind_groups = cmd_buf_limits.max_bind_groups;
                     if (index as u32) >= max_bind_groups {
-                        return Err(ComputePassError::BindGroupIndexOutOfRange {
+                        return Err(ComputePassErrorInner::BindGroupIndexOutOfRange {
                             index,
                             max: max_bind_groups,
                         });
@@ -260,11 +289,10 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         .extend_from_slice(&base.dynamic_offsets[..num_dynamic_offsets as usize]);
                     base.dynamic_offsets = &base.dynamic_offsets[num_dynamic_offsets as usize..];
 
-                    let bind_group = cmd_buf
-                        .trackers
+                    let bind_group = cmd_buf_trackers
                         .bind_groups
                         .use_extend(&*bind_group_guard, bind_group_id, (), ())
-                        .map_err(|_| ComputePassError::InvalidBindGroup(bind_group_id))?;
+                        .map_err(|_| ComputePassErrorInner::InvalidBindGroup(bind_group_id))?;
                     bind_group.validate_dynamic_bindings(&temp_offsets)?;
 
                     if let Some((pipeline_layout_id, follow_ups)) = state.binder.provide_entry(
@@ -290,85 +318,87 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                             );
                         }
                     }
-                }
+                    Ok(())
+                })?,
                 ComputeCommand::SetPipeline(pipeline_id) => {
                     if state.pipeline.set_and_check_redundant(pipeline_id) {
                         continue;
                     }
+                    with(ComputePassError::SetPipeline, || {
+                        let pipeline = cmd_buf_trackers
+                            .compute_pipes
+                            .use_extend(&*pipeline_guard, pipeline_id, (), ())
+                            .map_err(|_| ComputePassErrorInner::InvalidPipeline(pipeline_id))?;
 
-                    let pipeline = cmd_buf
-                        .trackers
-                        .compute_pipes
-                        .use_extend(&*pipeline_guard, pipeline_id, (), ())
-                        .map_err(|_| ComputePassError::InvalidPipeline(pipeline_id))?;
+                        unsafe {
+                            raw.bind_compute_pipeline(&pipeline.raw);
+                        }
 
-                    unsafe {
-                        raw.bind_compute_pipeline(&pipeline.raw);
-                    }
+                        // Rebind resources
+                        if state.binder.pipeline_layout_id != Some(pipeline.layout_id.value) {
+                            let pipeline_layout = &pipeline_layout_guard[pipeline.layout_id.value];
 
-                    // Rebind resources
-                    if state.binder.pipeline_layout_id != Some(pipeline.layout_id.value) {
-                        let pipeline_layout = &pipeline_layout_guard[pipeline.layout_id.value];
+                            state.binder.change_pipeline_layout(
+                                &*pipeline_layout_guard,
+                                pipeline.layout_id.value,
+                            );
 
-                        state.binder.change_pipeline_layout(
-                            &*pipeline_layout_guard,
-                            pipeline.layout_id.value,
-                        );
+                            let mut is_compatible = true;
 
-                        let mut is_compatible = true;
-
-                        for (index, (entry, &bgl_id)) in state
-                            .binder
-                            .entries
-                            .iter_mut()
-                            .zip(&pipeline_layout.bind_group_layout_ids)
-                            .enumerate()
-                        {
-                            match entry.expect_layout(bgl_id) {
-                                LayoutChange::Match(bg_id, offsets) if is_compatible => {
-                                    let desc_set = bind_group_guard[bg_id].raw.raw();
-                                    unsafe {
-                                        raw.bind_compute_descriptor_sets(
-                                            &pipeline_layout.raw,
-                                            index,
-                                            iter::once(desc_set),
-                                            offsets.iter().cloned(),
-                                        );
+                            for (index, (entry, &bgl_id)) in state
+                                .binder
+                                .entries
+                                .iter_mut()
+                                .zip(&pipeline_layout.bind_group_layout_ids)
+                                .enumerate()
+                            {
+                                match entry.expect_layout(bgl_id) {
+                                    LayoutChange::Match(bg_id, offsets) if is_compatible => {
+                                        let desc_set = bind_group_guard[bg_id].raw.raw();
+                                        unsafe {
+                                            raw.bind_compute_descriptor_sets(
+                                                &pipeline_layout.raw,
+                                                index,
+                                                iter::once(desc_set),
+                                                offsets.iter().cloned(),
+                                            );
+                                        }
+                                    }
+                                    LayoutChange::Match(..) | LayoutChange::Unchanged => {}
+                                    LayoutChange::Mismatch => {
+                                        is_compatible = false;
                                     }
                                 }
-                                LayoutChange::Match(..) | LayoutChange::Unchanged => {}
-                                LayoutChange::Mismatch => {
-                                    is_compatible = false;
-                                }
+                            }
+
+                            // Clear push constant ranges
+                            let non_overlapping = super::bind::compute_nonoverlapping_ranges(
+                                &pipeline_layout.push_constant_ranges,
+                            );
+                            for range in non_overlapping {
+                                let offset = range.range.start;
+                                let size_bytes = range.range.end - offset;
+                                super::push_constant_clear(
+                                    offset,
+                                    size_bytes,
+                                    |clear_offset, clear_data| unsafe {
+                                        raw.push_compute_constants(
+                                            &pipeline_layout.raw,
+                                            clear_offset,
+                                            clear_data,
+                                        );
+                                    },
+                                );
                             }
                         }
-
-                        // Clear push constant ranges
-                        let non_overlapping = super::bind::compute_nonoverlapping_ranges(
-                            &pipeline_layout.push_constant_ranges,
-                        );
-                        for range in non_overlapping {
-                            let offset = range.range.start;
-                            let size_bytes = range.range.end - offset;
-                            super::push_constant_clear(
-                                offset,
-                                size_bytes,
-                                |clear_offset, clear_data| unsafe {
-                                    raw.push_compute_constants(
-                                        &pipeline_layout.raw,
-                                        clear_offset,
-                                        clear_data,
-                                    );
-                                },
-                            );
-                        }
-                    }
+                        Ok(())
+                    })?
                 }
                 ComputeCommand::SetPushConstant {
                     offset,
                     size_bytes,
                     values_offset,
-                } => {
+                } => with(ComputePassError::SetPushConstant, || {
                     let end_offset_bytes = offset + size_bytes;
                     let values_end_offset =
                         (values_offset + size_bytes / wgt::PUSH_CONSTANT_ALIGNMENT) as usize;
@@ -379,7 +409,9 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         .binder
                         .pipeline_layout_id
                         //TODO: don't error here, lazily update the push constants
-                        .ok_or(ComputePassError::Dispatch(DispatchError::MissingPipeline))?;
+                        .ok_or(ComputePassErrorInner::Dispatch(
+                            DispatchError::MissingPipeline,
+                        ))?;
                     let pipeline_layout = &pipeline_layout_guard[pipeline_layout_id];
 
                     pipeline_layout
@@ -388,15 +420,16 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                             offset,
                             end_offset_bytes,
                         )
-                        .map_err(ComputePassError::from)?;
+                        .map_err(ComputePassErrorInner::from)?;
 
                     unsafe { raw.push_compute_constants(&pipeline_layout.raw, offset, data_slice) }
-                }
-                ComputeCommand::Dispatch(groups) => {
+                    Ok(())
+                })?,
+                ComputeCommand::Dispatch(groups) => with(ComputePassError::Dispatch, || {
                     state.is_ready()?;
                     state.flush_states(
                         raw,
-                        &mut cmd_buf.trackers,
+                        cmd_buf_trackers,
                         &*bind_group_guard,
                         &*buffer_guard,
                         &*texture_guard,
@@ -404,31 +437,35 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     unsafe {
                         raw.dispatch(groups);
                     }
-                }
+                    Ok(())
+                })?,
                 ComputeCommand::DispatchIndirect { buffer_id, offset } => {
-                    state.is_ready()?;
+                    with(ComputePassError::DispatchIndirect, || {
+                        state.is_ready()?;
 
-                    let indirect_buffer = state
-                        .trackers
-                        .buffers
-                        .use_extend(&*buffer_guard, buffer_id, (), BufferUse::INDIRECT)
-                        .map_err(|_| ComputePassError::InvalidIndirectBuffer(buffer_id))?;
-                    check_buffer_usage(indirect_buffer.usage, BufferUsage::INDIRECT)?;
-                    let &(ref buf_raw, _) = indirect_buffer
-                        .raw
-                        .as_ref()
-                        .ok_or(ComputePassError::InvalidIndirectBuffer(buffer_id))?;
+                        let indirect_buffer = state
+                            .trackers
+                            .buffers
+                            .use_extend(&*buffer_guard, buffer_id, (), BufferUse::INDIRECT)
+                            .map_err(|_| ComputePassErrorInner::InvalidIndirectBuffer(buffer_id))?;
+                        check_buffer_usage(indirect_buffer.usage, BufferUsage::INDIRECT)?;
+                        let &(ref buf_raw, _) = indirect_buffer
+                            .raw
+                            .as_ref()
+                            .ok_or(ComputePassErrorInner::InvalidIndirectBuffer(buffer_id))?;
 
-                    state.flush_states(
-                        raw,
-                        &mut cmd_buf.trackers,
-                        &*bind_group_guard,
-                        &*buffer_guard,
-                        &*texture_guard,
-                    )?;
-                    unsafe {
-                        raw.dispatch_indirect(buf_raw, offset);
-                    }
+                        state.flush_states(
+                            raw,
+                            cmd_buf_trackers,
+                            &*bind_group_guard,
+                            &*buffer_guard,
+                            &*texture_guard,
+                        )?;
+                        unsafe {
+                            raw.dispatch_indirect(buf_raw, offset);
+                        }
+                        Ok(())
+                    })?
                 }
                 ComputeCommand::PushDebugGroup { color, len } => {
                     state.debug_scope_depth += 1;
@@ -441,7 +478,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                 }
                 ComputeCommand::PopDebugGroup => {
                     if state.debug_scope_depth == 0 {
-                        return Err(ComputePassError::InvalidPopDebugGroup);
+                        return Err(ComputePassErrorInner::InvalidPopDebugGroup.into());
                     }
                     state.debug_scope_depth -= 1;
                     unsafe {

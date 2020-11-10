@@ -695,6 +695,34 @@ pub enum RenderBundleError {
 
 type RenderBundleErrorCtx = fn(RenderBundleErrorInner) -> RenderBundleError;
 
+fn set_error_ctx(command: &RenderCommand, err_ctx: &mut RenderBundleErrorCtx) {
+    *err_ctx = match *command {
+        RenderCommand::SetBindGroup { .. } => RenderBundleError::SetBindGroup,
+        RenderCommand::SetPipeline(_) => RenderBundleError::SetPipeline,
+        RenderCommand::SetIndexBuffer { .. } => RenderBundleError::SetIndexBuffer,
+        RenderCommand::SetVertexBuffer { .. } => RenderBundleError::SetVertexBuffer,
+        RenderCommand::SetPushConstant { .. } => RenderBundleError::SetPushConstant,
+        RenderCommand::Draw { .. } => RenderBundleError::Draw,
+        RenderCommand::DrawIndexed { .. } => RenderBundleError::DrawIndexed,
+        RenderCommand::MultiDrawIndirect { indexed: true, .. }
+        | RenderCommand::MultiDrawIndirectCount { indexed: true, .. } => {
+            RenderBundleError::DrawIndexedIndirect
+        }
+        RenderCommand::MultiDrawIndirect { indexed: false, .. }
+        | RenderCommand::MultiDrawIndirectCount { indexed: false, .. } => {
+            RenderBundleError::DrawIndirect
+        }
+        RenderCommand::PushDebugGroup { .. }
+        | RenderCommand::PopDebugGroup
+        | RenderCommand::InsertDebugMarker { .. }
+        | RenderCommand::ExecuteBundle(_)
+        | RenderCommand::SetBlendColor(_)
+        | RenderCommand::SetStencilReference(_)
+        | RenderCommand::SetViewport { .. }
+        | RenderCommand::SetScissor(_) => RenderBundleError::Inner,
+    };
+}
+
 impl<G: GlobalIdentityHandlerFactory> Global<G> {
     pub fn render_bundle_encoder_finish<B: GfxBackend>(
         &self,
@@ -746,14 +774,13 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             let mut pipeline_layout_id = None::<id::Valid<id::PipelineLayoutId>>;
 
             for &command in base.commands {
+                set_error_ctx(&command, err_ctx);
                 match command {
                     RenderCommand::SetBindGroup {
                         index,
                         num_dynamic_offsets,
                         bind_group_id,
                     } => {
-                        *err_ctx = RenderBundleError::SetBindGroup;
-
                         let max_bind_groups = device.limits.max_bind_groups;
                         if (index as u32) >= max_bind_groups {
                             Err(RenderCommandError::BindGroupIndexOutOfRange {
@@ -790,8 +817,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         state.trackers.merge_extend(&bind_group.used)?;
                     }
                     RenderCommand::SetPipeline(pipeline_id) => {
-                        *err_ctx = RenderBundleError::SetPipeline;
-
                         if state.pipeline.set_and_check_redundant(pipeline_id) {
                             continue;
                         }
@@ -828,8 +853,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         offset,
                         size,
                     } => {
-                        *err_ctx = RenderBundleError::SetIndexBuffer;
-
                         let buffer = state
                             .trackers
                             .buffers
@@ -850,8 +873,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         offset,
                         size,
                     } => {
-                        *err_ctx = RenderBundleError::SetVertexBuffer;
-
                         let buffer = state
                             .trackers
                             .buffers
@@ -872,8 +893,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         size_bytes,
                         values_offset: _,
                     } => {
-                        *err_ctx = RenderBundleError::SetPushConstant;
-
                         let end_offset = offset + size_bytes;
 
                         let pipeline_layout_id =
@@ -892,8 +911,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         first_vertex,
                         first_instance,
                     } => {
-                        *err_ctx = RenderBundleError::Draw;
-
                         let (vertex_limit, instance_limit) = state.vertex_limits();
                         let last_vertex = first_vertex + vertex_count;
                         if last_vertex > vertex_limit {
@@ -920,8 +937,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         base_vertex: _,
                         first_instance,
                     } => {
-                        *err_ctx = RenderBundleError::DrawIndexed;
-
                         //TODO: validate that base_vertex + max_index() is within the provided range
                         let (_, instance_limit) = state.vertex_limits();
                         let index_limit = state.index.limit();
@@ -950,8 +965,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         count: None,
                         indexed: false,
                     } => {
-                        *err_ctx = RenderBundleError::DrawIndirect;
-
                         let buffer = state
                             .trackers
                             .buffers
@@ -970,8 +983,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         count: None,
                         indexed: true,
                     } => {
-                        *err_ctx = RenderBundleError::DrawIndexedIndirect;
-
                         let buffer = state
                             .trackers
                             .buffers

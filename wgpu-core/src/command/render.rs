@@ -430,6 +430,34 @@ pub enum RenderPassError {
 
 type RenderPassErrorCtx = fn(RenderPassErrorInner) -> RenderPassError;
 
+fn set_error_ctx(command: &RenderCommand, err_ctx: &mut RenderPassErrorCtx) {
+    *err_ctx = match *command {
+        RenderCommand::SetBindGroup { .. } => RenderPassError::SetBindGroup,
+        RenderCommand::SetPipeline(_) => RenderPassError::SetPipeline,
+        RenderCommand::SetIndexBuffer { .. } => RenderPassError::SetIndexBuffer,
+        RenderCommand::SetVertexBuffer { .. } => RenderPassError::SetVertexBuffer,
+        RenderCommand::SetBlendColor(_) => RenderPassError::SetBlendColor,
+        RenderCommand::SetStencilReference(_) => RenderPassError::SetStencilReference,
+        RenderCommand::SetViewport { .. } => RenderPassError::SetViewport,
+        RenderCommand::SetScissor(_) => RenderPassError::SetScissor,
+        RenderCommand::SetPushConstant { .. } => RenderPassError::SetPushConstant,
+        RenderCommand::Draw { .. } => RenderPassError::Draw,
+        RenderCommand::DrawIndexed { .. } => RenderPassError::DrawIndexed,
+        RenderCommand::MultiDrawIndirect { indexed: false, .. }
+        | RenderCommand::MultiDrawIndirectCount { indexed: false, .. } => {
+            RenderPassError::DrawIndirect
+        }
+        RenderCommand::MultiDrawIndirect { indexed: true, .. }
+        | RenderCommand::MultiDrawIndirectCount { indexed: true, .. } => {
+            RenderPassError::DrawIndexedIndirect
+        }
+        RenderCommand::ExecuteBundle(_) => RenderPassError::ExecuteBundle,
+        RenderCommand::PushDebugGroup { .. }
+        | RenderCommand::PopDebugGroup
+        | RenderCommand::InsertDebugMarker { .. } => RenderPassError::Inner,
+    };
+}
+
 fn check_device_features(
     actual: wgt::Features,
     expected: wgt::Features,
@@ -779,7 +807,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             };
 
             if sample_count & sample_count_limit == 0 {
-                return Err(RenderPassErrorInner::InvalidSampleCount(sample_count).into());
+                return Err(RenderPassErrorInner::InvalidSampleCount(sample_count));
             }
 
             let mut render_pass_cache = device.render_passes.lock();
@@ -1019,14 +1047,13 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let mut temp_offsets = Vec::new();
 
         for command in base.commands {
+            set_error_ctx(command, err_ctx);
             match *command {
                 RenderCommand::SetBindGroup {
                     index,
                     num_dynamic_offsets,
                     bind_group_id,
                 } => {
-                    *err_ctx = RenderPassError::SetBindGroup;
-
                     let max_bind_groups = device.limits.max_bind_groups;
                     if (index as u32) >= max_bind_groups {
                         return Err(RenderCommandError::BindGroupIndexOutOfRange {
@@ -1076,8 +1103,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     };
                 }
                 RenderCommand::SetPipeline(pipeline_id) => {
-                    *err_ctx = RenderPassError::SetPipeline;
-
                     if state.pipeline.set_and_check_redundant(pipeline_id) {
                         continue;
                     }
@@ -1216,8 +1241,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     offset,
                     size,
                 } => {
-                    *err_ctx = RenderPassError::SetIndexBuffer;
-
                     let buffer = trackers
                         .buffers
                         .use_extend(&*buffer_guard, buffer_id, (), BufferUse::INDEX)
@@ -1254,8 +1277,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     offset,
                     size,
                 } => {
-                    *err_ctx = RenderPassError::SetVertexBuffer;
-
                     let buffer = trackers
                         .buffers
                         .use_extend(&*buffer_guard, buffer_id, (), BufferUse::VERTEX)
@@ -1286,16 +1307,12 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     state.vertex.update_limits();
                 }
                 RenderCommand::SetBlendColor(ref color) => {
-                    *err_ctx = RenderPassError::SetBlendColor;
-
                     state.blend_color = OptionalState::Set;
                     unsafe {
                         raw.set_blend_constants(conv::map_color_f32(color));
                     }
                 }
                 RenderCommand::SetStencilReference(value) => {
-                    *err_ctx = RenderPassError::SetStencilReference;
-
                     state.stencil_reference = value;
                     if state
                         .pipeline_flags
@@ -1311,8 +1328,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     depth_min,
                     depth_max,
                 } => {
-                    *err_ctx = RenderPassError::SetViewport;
-
                     use std::{convert::TryFrom, i16};
                     if rect.w <= 0.0
                         || rect.h <= 0.0
@@ -1345,8 +1360,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     size_bytes,
                     values_offset,
                 } => {
-                    *err_ctx = RenderPassError::SetPushConstant;
-
                     let values_offset =
                         values_offset.ok_or(RenderPassErrorInner::InvalidValuesOffset)?;
 
@@ -1376,8 +1389,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 RenderCommand::SetScissor(ref rect) => {
-                    *err_ctx = RenderPassError::SetScissor;
-
                     use std::{convert::TryFrom, i16};
                     if rect.w == 0
                         || rect.h == 0
@@ -1402,8 +1413,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     first_vertex,
                     first_instance,
                 } => {
-                    *err_ctx = RenderPassError::Draw;
-
                     state.is_ready()?;
                     let last_vertex = first_vertex + vertex_count;
                     let vertex_limit = state.vertex.vertex_limit;
@@ -1436,8 +1445,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     base_vertex,
                     first_instance,
                 } => {
-                    *err_ctx = RenderPassError::DrawIndexed;
-
                     state.is_ready()?;
 
                     //TODO: validate that base_vertex + max_index() is within the provided range
@@ -1472,12 +1479,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     count,
                     indexed,
                 } => {
-                    *err_ctx = if indexed {
-                        RenderPassError::DrawIndexedIndirect
-                    } else {
-                        RenderPassError::DrawIndirect
-                    };
-
                     state.is_ready()?;
 
                     let stride = match indexed {
@@ -1535,12 +1536,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     max_count,
                     indexed,
                 } => {
-                    *err_ctx = if indexed {
-                        RenderPassError::DrawIndexedIndirect
-                    } else {
-                        RenderPassError::DrawIndirect
-                    };
-
                     state.is_ready()?;
 
                     let stride = match indexed {
@@ -1619,8 +1614,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 RenderCommand::PushDebugGroup { color, len } => {
-                    *err_ctx = RenderPassError::Inner;
-
                     state.debug_scope_depth += 1;
                     let label = str::from_utf8(&base.string_data[..len]).unwrap();
                     unsafe {
@@ -1629,10 +1622,8 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     base.string_data = &base.string_data[len..];
                 }
                 RenderCommand::PopDebugGroup => {
-                    *err_ctx = RenderPassError::Inner;
-
                     if state.debug_scope_depth == 0 {
-                        return Err(RenderPassErrorInner::InvalidPopDebugGroup.into());
+                        return Err(RenderPassErrorInner::InvalidPopDebugGroup);
                     }
                     state.debug_scope_depth -= 1;
                     unsafe {
@@ -1640,8 +1631,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 RenderCommand::InsertDebugMarker { color, len } => {
-                    *err_ctx = RenderPassError::Inner;
-
                     let label = str::from_utf8(&base.string_data[..len]).unwrap();
                     unsafe {
                         raw.insert_debug_marker(label, color);
@@ -1649,8 +1638,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     base.string_data = &base.string_data[len..];
                 }
                 RenderCommand::ExecuteBundle(bundle_id) => {
-                    *err_ctx = RenderPassError::ExecuteBundle;
-
                     let bundle = trackers
                         .bundles
                         .use_extend(&*bundle_guard, bundle_id, (), ())

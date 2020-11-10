@@ -163,6 +163,19 @@ pub enum ComputePassError {
 
 type ComputePassErrorCtx = fn(ComputePassErrorInner) -> ComputePassError;
 
+fn set_error_ctx(command: &ComputeCommand, err_ctx: &mut ComputePassErrorCtx) {
+    *err_ctx = match *command {
+        ComputeCommand::SetBindGroup { .. } => ComputePassError::SetBindGroup,
+        ComputeCommand::SetPipeline(_) => ComputePassError::SetPipeline,
+        ComputeCommand::SetPushConstant { .. } => ComputePassError::SetPushConstant,
+        ComputeCommand::Dispatch(_) => ComputePassError::Dispatch,
+        ComputeCommand::DispatchIndirect { .. } => ComputePassError::DispatchIndirect,
+        ComputeCommand::PushDebugGroup { .. }
+        | ComputeCommand::PopDebugGroup
+        | ComputeCommand::InsertDebugMarker { .. } => ComputePassError::Inner,
+    };
+}
+
 #[derive(Debug)]
 struct State {
     binder: Binder,
@@ -273,14 +286,13 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let mut temp_offsets = Vec::new();
 
         for command in base.commands {
+            set_error_ctx(&command, err_ctx);
             match *command {
                 ComputeCommand::SetBindGroup {
                     index,
                     num_dynamic_offsets,
                     bind_group_id,
                 } => {
-                    *err_ctx = ComputePassError::SetBindGroup;
-
                     let max_bind_groups = cmd_buf.limits.max_bind_groups;
                     if (index as u32) >= max_bind_groups {
                         return Err(ComputePassErrorInner::BindGroupIndexOutOfRange {
@@ -326,8 +338,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 ComputeCommand::SetPipeline(pipeline_id) => {
-                    *err_ctx = ComputePassError::SetPipeline;
-
                     if state.pipeline.set_and_check_redundant(pipeline_id) {
                         continue;
                     }
@@ -405,8 +415,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     size_bytes,
                     values_offset,
                 } => {
-                    *err_ctx = ComputePassError::SetPushConstant;
-
                     let end_offset_bytes = offset + size_bytes;
                     let values_end_offset =
                         (values_offset + size_bytes / wgt::PUSH_CONSTANT_ALIGNMENT) as usize;
@@ -433,8 +441,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     unsafe { raw.push_compute_constants(&pipeline_layout.raw, offset, data_slice) }
                 }
                 ComputeCommand::Dispatch(groups) => {
-                    *err_ctx = ComputePassError::Dispatch;
-
                     state.is_ready()?;
                     state.flush_states(
                         raw,
@@ -448,8 +454,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 ComputeCommand::DispatchIndirect { buffer_id, offset } => {
-                    *err_ctx = ComputePassError::DispatchIndirect;
-
                     state.is_ready()?;
 
                     let indirect_buffer = state
@@ -475,8 +479,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 ComputeCommand::PushDebugGroup { color, len } => {
-                    *err_ctx = ComputePassError::Inner;
-
                     state.debug_scope_depth += 1;
 
                     let label = str::from_utf8(&base.string_data[..len]).unwrap();
@@ -486,8 +488,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     base.string_data = &base.string_data[len..];
                 }
                 ComputeCommand::PopDebugGroup => {
-                    *err_ctx = ComputePassError::Inner;
-
                     if state.debug_scope_depth == 0 {
                         return Err(ComputePassErrorInner::InvalidPopDebugGroup);
                     }
@@ -497,8 +497,6 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 ComputeCommand::InsertDebugMarker { color, len } => {
-                    *err_ctx = ComputePassError::Inner;
-
                     let label = str::from_utf8(&base.string_data[..len]).unwrap();
                     unsafe { raw.insert_debug_marker(label, color) }
                     base.string_data = &base.string_data[len..];

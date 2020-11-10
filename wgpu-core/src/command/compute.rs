@@ -161,12 +161,7 @@ pub enum ComputePassError {
     DispatchIndirect(#[source] ComputePassErrorInner),
 }
 
-fn with<T>(
-    ctx: impl FnOnce(ComputePassErrorInner) -> ComputePassError,
-    f: impl FnOnce() -> Result<T, ComputePassErrorInner>,
-) -> Result<T, ComputePassError> {
-    f().map_err(ctx)
-}
+type ComputePassErrorCtx = fn(ComputePassErrorInner) -> ComputePassError;
 
 #[derive(Debug)]
 struct State {
@@ -234,17 +229,25 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
     pub fn command_encoder_run_compute_pass_impl<B: GfxBackend>(
         &self,
         encoder_id: id::CommandEncoderId,
-        mut base: BasePassRef<ComputeCommand>,
+        base: BasePassRef<ComputeCommand>,
     ) -> Result<(), ComputePassError> {
+        let mut err_ctx: ComputePassErrorCtx = ComputePassError::Inner;
+        self.command_encoder_run_compute_pass_impl_inner::<B>(encoder_id, base, &mut err_ctx)
+            .map_err(|e| err_ctx(e))
+    }
+
+    fn command_encoder_run_compute_pass_impl_inner<B: GfxBackend>(
+        &self,
+        encoder_id: id::CommandEncoderId,
+        mut base: BasePassRef<ComputeCommand>,
+        err_ctx: &mut ComputePassErrorCtx,
+    ) -> Result<(), ComputePassErrorInner> {
         span!(_guard, INFO, "CommandEncoder::run_compute_pass");
         let hub = B::hub(self);
         let mut token = Token::root();
 
         let (mut cmd_buf_guard, mut token) = hub.command_buffers.write(&mut token);
-        let cmd_buf = CommandBuffer::get_encoder(&mut *cmd_buf_guard, encoder_id)
-            .map_err(ComputePassErrorInner::from)?;
-        let cmd_buf_limits = &mut cmd_buf.limits;
-        let cmd_buf_trackers = &mut cmd_buf.trackers;
+        let cmd_buf = CommandBuffer::get_encoder(&mut *cmd_buf_guard, encoder_id)?;
         let raw = cmd_buf.raw.last_mut().unwrap();
 
         #[cfg(feature = "trace")]
@@ -262,7 +265,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let (texture_guard, _) = hub.textures.read(&mut token);
 
         let mut state = State {
-            binder: Binder::new(cmd_buf_limits.max_bind_groups),
+            binder: Binder::new(cmd_buf.limits.max_bind_groups),
             pipeline: StateChange::new(),
             trackers: TrackerSet::new(B::VARIANT),
             debug_scope_depth: 0,
@@ -275,8 +278,10 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     index,
                     num_dynamic_offsets,
                     bind_group_id,
-                } => with(ComputePassError::SetBindGroup, || {
-                    let max_bind_groups = cmd_buf_limits.max_bind_groups;
+                } => {
+                    *err_ctx = ComputePassError::SetBindGroup;
+
+                    let max_bind_groups = cmd_buf.limits.max_bind_groups;
                     if (index as u32) >= max_bind_groups {
                         return Err(ComputePassErrorInner::BindGroupIndexOutOfRange {
                             index,
@@ -289,7 +294,8 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         .extend_from_slice(&base.dynamic_offsets[..num_dynamic_offsets as usize]);
                     base.dynamic_offsets = &base.dynamic_offsets[num_dynamic_offsets as usize..];
 
-                    let bind_group = cmd_buf_trackers
+                    let bind_group = cmd_buf
+                        .trackers
                         .bind_groups
                         .use_extend(&*bind_group_guard, bind_group_id, (), ())
                         .map_err(|_| ComputePassErrorInner::InvalidBindGroup(bind_group_id))?;
@@ -318,87 +324,89 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                             );
                         }
                     }
-                    Ok(())
-                })?,
+                }
                 ComputeCommand::SetPipeline(pipeline_id) => {
+                    *err_ctx = ComputePassError::SetPipeline;
+
                     if state.pipeline.set_and_check_redundant(pipeline_id) {
                         continue;
                     }
-                    with(ComputePassError::SetPipeline, || {
-                        let pipeline = cmd_buf_trackers
-                            .compute_pipes
-                            .use_extend(&*pipeline_guard, pipeline_id, (), ())
-                            .map_err(|_| ComputePassErrorInner::InvalidPipeline(pipeline_id))?;
 
-                        unsafe {
-                            raw.bind_compute_pipeline(&pipeline.raw);
-                        }
+                    let pipeline = cmd_buf
+                        .trackers
+                        .compute_pipes
+                        .use_extend(&*pipeline_guard, pipeline_id, (), ())
+                        .map_err(|_| ComputePassErrorInner::InvalidPipeline(pipeline_id))?;
 
-                        // Rebind resources
-                        if state.binder.pipeline_layout_id != Some(pipeline.layout_id.value) {
-                            let pipeline_layout = &pipeline_layout_guard[pipeline.layout_id.value];
+                    unsafe {
+                        raw.bind_compute_pipeline(&pipeline.raw);
+                    }
 
-                            state.binder.change_pipeline_layout(
-                                &*pipeline_layout_guard,
-                                pipeline.layout_id.value,
-                            );
+                    // Rebind resources
+                    if state.binder.pipeline_layout_id != Some(pipeline.layout_id.value) {
+                        let pipeline_layout = &pipeline_layout_guard[pipeline.layout_id.value];
 
-                            let mut is_compatible = true;
+                        state.binder.change_pipeline_layout(
+                            &*pipeline_layout_guard,
+                            pipeline.layout_id.value,
+                        );
 
-                            for (index, (entry, &bgl_id)) in state
-                                .binder
-                                .entries
-                                .iter_mut()
-                                .zip(&pipeline_layout.bind_group_layout_ids)
-                                .enumerate()
-                            {
-                                match entry.expect_layout(bgl_id) {
-                                    LayoutChange::Match(bg_id, offsets) if is_compatible => {
-                                        let desc_set = bind_group_guard[bg_id].raw.raw();
-                                        unsafe {
-                                            raw.bind_compute_descriptor_sets(
-                                                &pipeline_layout.raw,
-                                                index,
-                                                iter::once(desc_set),
-                                                offsets.iter().cloned(),
-                                            );
-                                        }
-                                    }
-                                    LayoutChange::Match(..) | LayoutChange::Unchanged => {}
-                                    LayoutChange::Mismatch => {
-                                        is_compatible = false;
+                        let mut is_compatible = true;
+
+                        for (index, (entry, &bgl_id)) in state
+                            .binder
+                            .entries
+                            .iter_mut()
+                            .zip(&pipeline_layout.bind_group_layout_ids)
+                            .enumerate()
+                        {
+                            match entry.expect_layout(bgl_id) {
+                                LayoutChange::Match(bg_id, offsets) if is_compatible => {
+                                    let desc_set = bind_group_guard[bg_id].raw.raw();
+                                    unsafe {
+                                        raw.bind_compute_descriptor_sets(
+                                            &pipeline_layout.raw,
+                                            index,
+                                            iter::once(desc_set),
+                                            offsets.iter().cloned(),
+                                        );
                                     }
                                 }
-                            }
-
-                            // Clear push constant ranges
-                            let non_overlapping = super::bind::compute_nonoverlapping_ranges(
-                                &pipeline_layout.push_constant_ranges,
-                            );
-                            for range in non_overlapping {
-                                let offset = range.range.start;
-                                let size_bytes = range.range.end - offset;
-                                super::push_constant_clear(
-                                    offset,
-                                    size_bytes,
-                                    |clear_offset, clear_data| unsafe {
-                                        raw.push_compute_constants(
-                                            &pipeline_layout.raw,
-                                            clear_offset,
-                                            clear_data,
-                                        );
-                                    },
-                                );
+                                LayoutChange::Match(..) | LayoutChange::Unchanged => {}
+                                LayoutChange::Mismatch => {
+                                    is_compatible = false;
+                                }
                             }
                         }
-                        Ok(())
-                    })?
+
+                        // Clear push constant ranges
+                        let non_overlapping = super::bind::compute_nonoverlapping_ranges(
+                            &pipeline_layout.push_constant_ranges,
+                        );
+                        for range in non_overlapping {
+                            let offset = range.range.start;
+                            let size_bytes = range.range.end - offset;
+                            super::push_constant_clear(
+                                offset,
+                                size_bytes,
+                                |clear_offset, clear_data| unsafe {
+                                    raw.push_compute_constants(
+                                        &pipeline_layout.raw,
+                                        clear_offset,
+                                        clear_data,
+                                    );
+                                },
+                            );
+                        }
+                    }
                 }
                 ComputeCommand::SetPushConstant {
                     offset,
                     size_bytes,
                     values_offset,
-                } => with(ComputePassError::SetPushConstant, || {
+                } => {
+                    *err_ctx = ComputePassError::SetPushConstant;
+
                     let end_offset_bytes = offset + size_bytes;
                     let values_end_offset =
                         (values_offset + size_bytes / wgt::PUSH_CONSTANT_ALIGNMENT) as usize;
@@ -423,13 +431,14 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         .map_err(ComputePassErrorInner::from)?;
 
                     unsafe { raw.push_compute_constants(&pipeline_layout.raw, offset, data_slice) }
-                    Ok(())
-                })?,
-                ComputeCommand::Dispatch(groups) => with(ComputePassError::Dispatch, || {
+                }
+                ComputeCommand::Dispatch(groups) => {
+                    *err_ctx = ComputePassError::Dispatch;
+
                     state.is_ready()?;
                     state.flush_states(
                         raw,
-                        cmd_buf_trackers,
+                        &mut cmd_buf.trackers,
                         &*bind_group_guard,
                         &*buffer_guard,
                         &*texture_guard,
@@ -437,37 +446,37 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     unsafe {
                         raw.dispatch(groups);
                     }
-                    Ok(())
-                })?,
+                }
                 ComputeCommand::DispatchIndirect { buffer_id, offset } => {
-                    with(ComputePassError::DispatchIndirect, || {
-                        state.is_ready()?;
+                    *err_ctx = ComputePassError::DispatchIndirect;
 
-                        let indirect_buffer = state
-                            .trackers
-                            .buffers
-                            .use_extend(&*buffer_guard, buffer_id, (), BufferUse::INDIRECT)
-                            .map_err(|_| ComputePassErrorInner::InvalidIndirectBuffer(buffer_id))?;
-                        check_buffer_usage(indirect_buffer.usage, BufferUsage::INDIRECT)?;
-                        let &(ref buf_raw, _) = indirect_buffer
-                            .raw
-                            .as_ref()
-                            .ok_or(ComputePassErrorInner::InvalidIndirectBuffer(buffer_id))?;
+                    state.is_ready()?;
 
-                        state.flush_states(
-                            raw,
-                            cmd_buf_trackers,
-                            &*bind_group_guard,
-                            &*buffer_guard,
-                            &*texture_guard,
-                        )?;
-                        unsafe {
-                            raw.dispatch_indirect(buf_raw, offset);
-                        }
-                        Ok(())
-                    })?
+                    let indirect_buffer = state
+                        .trackers
+                        .buffers
+                        .use_extend(&*buffer_guard, buffer_id, (), BufferUse::INDIRECT)
+                        .map_err(|_| ComputePassErrorInner::InvalidIndirectBuffer(buffer_id))?;
+                    check_buffer_usage(indirect_buffer.usage, BufferUsage::INDIRECT)?;
+                    let &(ref buf_raw, _) = indirect_buffer
+                        .raw
+                        .as_ref()
+                        .ok_or(ComputePassErrorInner::InvalidIndirectBuffer(buffer_id))?;
+
+                    state.flush_states(
+                        raw,
+                        &mut cmd_buf.trackers,
+                        &*bind_group_guard,
+                        &*buffer_guard,
+                        &*texture_guard,
+                    )?;
+                    unsafe {
+                        raw.dispatch_indirect(buf_raw, offset);
+                    }
                 }
                 ComputeCommand::PushDebugGroup { color, len } => {
+                    *err_ctx = ComputePassError::Inner;
+
                     state.debug_scope_depth += 1;
 
                     let label = str::from_utf8(&base.string_data[..len]).unwrap();
@@ -477,8 +486,10 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     base.string_data = &base.string_data[len..];
                 }
                 ComputeCommand::PopDebugGroup => {
+                    *err_ctx = ComputePassError::Inner;
+
                     if state.debug_scope_depth == 0 {
-                        return Err(ComputePassErrorInner::InvalidPopDebugGroup.into());
+                        return Err(ComputePassErrorInner::InvalidPopDebugGroup);
                     }
                     state.debug_scope_depth -= 1;
                     unsafe {
@@ -486,12 +497,16 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
                 ComputeCommand::InsertDebugMarker { color, len } => {
+                    *err_ctx = ComputePassError::Inner;
+
                     let label = str::from_utf8(&base.string_data[..len]).unwrap();
                     unsafe { raw.insert_debug_marker(label, color) }
                     base.string_data = &base.string_data[len..];
                 }
             }
         }
+
+        *err_ctx = ComputePassError::Inner;
 
         Ok(())
     }

@@ -689,14 +689,11 @@ pub enum RenderBundleError {
     DrawIndexed(#[source] RenderBundleErrorInner),
     #[error("In a indirect draw command")]
     DrawIndirect(#[source] RenderBundleErrorInner),
+    #[error("In a indexed indirect draw command")]
+    DrawIndexedIndirect(#[source] RenderBundleErrorInner),
 }
 
-fn with<T>(
-    ctx: impl FnOnce(RenderBundleErrorInner) -> RenderBundleError,
-    f: impl FnOnce() -> Result<T, RenderBundleErrorInner>,
-) -> Result<T, RenderBundleError> {
-    f().map_err(ctx)
-}
+type RenderBundleErrorCtx = fn(RenderBundleErrorInner) -> RenderBundleError;
 
 impl<G: GlobalIdentityHandlerFactory> Global<G> {
     pub fn render_bundle_encoder_finish<B: GfxBackend>(
@@ -705,6 +702,18 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         desc: &RenderBundleDescriptor,
         id_in: Input<G, id::RenderBundleId>,
     ) -> Result<id::RenderBundleId, RenderBundleError> {
+        let mut err_ctx: RenderBundleErrorCtx = RenderBundleError::Inner;
+        self.render_bundle_encoder_finish_inner::<B>(bundle_encoder, desc, id_in, &mut err_ctx)
+            .map_err(|e| err_ctx(e))
+    }
+
+    fn render_bundle_encoder_finish_inner<B: GfxBackend>(
+        &self,
+        bundle_encoder: RenderBundleEncoder,
+        desc: &RenderBundleDescriptor,
+        id_in: Input<G, id::RenderBundleId>,
+        err_ctx: &mut RenderBundleErrorCtx,
+    ) -> Result<id::RenderBundleId, RenderBundleErrorInner> {
         span!(_guard, INFO, "RenderBundleEncoder::finish");
         let hub = B::hub(self);
         let mut token = Token::root();
@@ -712,8 +721,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
 
         let device = device_guard
             .get(bundle_encoder.parent_id)
-            .map_err(|_| DeviceError::Invalid)
-            .map_err(RenderBundleErrorInner::from)?;
+            .map_err(|_| DeviceError::Invalid)?;
         let render_bundle = {
             let (pipeline_layout_guard, mut token) = hub.pipeline_layouts.read(&mut token);
             let (bind_group_guard, mut token) = hub.bind_groups.read(&mut token);
@@ -743,7 +751,9 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         index,
                         num_dynamic_offsets,
                         bind_group_id,
-                    } => with(RenderBundleError::SetBindGroup, || {
+                    } => {
+                        *err_ctx = RenderBundleError::SetBindGroup;
+
                         let max_bind_groups = device.limits.max_bind_groups;
                         if (index as u32) >= max_bind_groups {
                             Err(RenderCommandError::BindGroupIndexOutOfRange {
@@ -778,47 +788,48 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
 
                         state.set_bind_group(index, bind_group_id, bind_group.layout_id, offsets);
                         state.trackers.merge_extend(&bind_group.used)?;
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::SetPipeline(pipeline_id) => {
+                        *err_ctx = RenderBundleError::SetPipeline;
+
                         if state.pipeline.set_and_check_redundant(pipeline_id) {
                             continue;
                         }
-                        with(RenderBundleError::SetPipeline, || {
-                            let pipeline = state
-                                .trackers
-                                .render_pipes
-                                .use_extend(&*pipeline_guard, pipeline_id, (), ())
-                                .unwrap();
 
-                            bundle_encoder
-                                .context
-                                .check_compatible(&pipeline.pass_context)
-                                .map_err(RenderCommandError::IncompatiblePipeline)?;
+                        let pipeline = state
+                            .trackers
+                            .render_pipes
+                            .use_extend(&*pipeline_guard, pipeline_id, (), ())
+                            .unwrap();
 
-                            //TODO: check read-only depth
+                        bundle_encoder
+                            .context
+                            .check_compatible(&pipeline.pass_context)
+                            .map_err(RenderCommandError::IncompatiblePipeline)?;
 
-                            let layout = &pipeline_layout_guard[pipeline.layout_id.value];
-                            pipeline_layout_id = Some(pipeline.layout_id.value);
+                        //TODO: check read-only depth
 
-                            state.set_pipeline(
-                                pipeline.index_format,
-                                &pipeline.vertex_strides,
-                                &layout.bind_group_layout_ids,
-                                &layout.push_constant_ranges,
-                            );
-                            commands.push(command);
-                            if let Some(iter) = state.flush_push_constants() {
-                                commands.extend(iter)
-                            }
-                            Ok(())
-                        })?
+                        let layout = &pipeline_layout_guard[pipeline.layout_id.value];
+                        pipeline_layout_id = Some(pipeline.layout_id.value);
+
+                        state.set_pipeline(
+                            pipeline.index_format,
+                            &pipeline.vertex_strides,
+                            &layout.bind_group_layout_ids,
+                            &layout.push_constant_ranges,
+                        );
+                        commands.push(command);
+                        if let Some(iter) = state.flush_push_constants() {
+                            commands.extend(iter)
+                        }
                     }
                     RenderCommand::SetIndexBuffer {
                         buffer_id,
                         offset,
                         size,
-                    } => with(RenderBundleError::SetIndexBuffer, || {
+                    } => {
+                        *err_ctx = RenderBundleError::SetIndexBuffer;
+
                         let buffer = state
                             .trackers
                             .buffers
@@ -832,14 +843,15 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                             None => buffer.size,
                         };
                         state.index.set_buffer(buffer_id, offset..end);
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::SetVertexBuffer {
                         slot,
                         buffer_id,
                         offset,
                         size,
-                    } => with(RenderBundleError::SetVertexBuffer, || {
+                    } => {
+                        *err_ctx = RenderBundleError::SetVertexBuffer;
+
                         let buffer = state
                             .trackers
                             .buffers
@@ -853,14 +865,15 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                             None => buffer.size,
                         };
                         state.vertex[slot as usize].set_buffer(buffer_id, offset..end);
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::SetPushConstant {
                         stages,
                         offset,
                         size_bytes,
                         values_offset: _,
-                    } => with(RenderBundleError::SetPushConstant, || {
+                    } => {
+                        *err_ctx = RenderBundleError::SetPushConstant;
+
                         let end_offset = offset + size_bytes;
 
                         let pipeline_layout_id =
@@ -872,14 +885,15 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                             .map_err(RenderCommandError::from)?;
 
                         commands.push(command);
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::Draw {
                         vertex_count,
                         instance_count,
                         first_vertex,
                         first_instance,
-                    } => with(RenderBundleError::Draw, || {
+                    } => {
+                        *err_ctx = RenderBundleError::Draw;
+
                         let (vertex_limit, instance_limit) = state.vertex_limits();
                         let last_vertex = first_vertex + vertex_count;
                         if last_vertex > vertex_limit {
@@ -898,15 +912,16 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         commands.extend(state.flush_vertices());
                         commands.extend(state.flush_binds());
                         commands.push(command);
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::DrawIndexed {
                         index_count,
                         instance_count,
                         first_index,
                         base_vertex: _,
                         first_instance,
-                    } => with(RenderBundleError::DrawIndexed, || {
+                    } => {
+                        *err_ctx = RenderBundleError::DrawIndexed;
+
                         //TODO: validate that base_vertex + max_index() is within the provided range
                         let (_, instance_limit) = state.vertex_limits();
                         let index_limit = state.index.limit();
@@ -928,14 +943,15 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         commands.extend(state.flush_vertices());
                         commands.extend(state.flush_binds());
                         commands.push(command);
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::MultiDrawIndirect {
                         buffer_id,
                         offset: _,
                         count: None,
                         indexed: false,
-                    } => with(RenderBundleError::DrawIndirect, || {
+                    } => {
+                        *err_ctx = RenderBundleError::DrawIndirect;
+
                         let buffer = state
                             .trackers
                             .buffers
@@ -947,14 +963,15 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         commands.extend(state.flush_vertices());
                         commands.extend(state.flush_binds());
                         commands.push(command);
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::MultiDrawIndirect {
                         buffer_id,
                         offset: _,
                         count: None,
                         indexed: true,
-                    } => with(RenderBundleError::DrawIndirect, || {
+                    } => {
+                        *err_ctx = RenderBundleError::DrawIndexedIndirect;
+
                         let buffer = state
                             .trackers
                             .buffers
@@ -967,8 +984,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                         commands.extend(state.flush_vertices());
                         commands.extend(state.flush_binds());
                         commands.push(command);
-                        Ok(())
-                    })?,
+                    }
                     RenderCommand::MultiDrawIndirect { .. }
                     | RenderCommand::MultiDrawIndirectCount { .. } => unimplemented!(),
                     RenderCommand::PushDebugGroup { color: _, len: _ } => unimplemented!(),
@@ -983,6 +999,8 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                     }
                 }
             }
+
+            *err_ctx = RenderBundleError::Inner;
 
             tracing::debug!("Render bundle {:?} = {:#?}", id_in, state.trackers);
             let _ = desc.label; //TODO: actually use

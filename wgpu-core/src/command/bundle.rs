@@ -695,8 +695,8 @@ pub enum RenderBundleError {
 
 type RenderBundleErrorCtx = fn(RenderBundleErrorInner) -> RenderBundleError;
 
-fn set_error_ctx(command: &RenderCommand, err_ctx: &mut RenderBundleErrorCtx) {
-    *err_ctx = match *command {
+fn error_context(command: &RenderCommand) -> RenderBundleErrorCtx {
+    match *command {
         RenderCommand::SetBindGroup { .. } => RenderBundleError::SetBindGroup,
         RenderCommand::SetPipeline(_) => RenderBundleError::SetPipeline,
         RenderCommand::SetIndexBuffer { .. } => RenderBundleError::SetIndexBuffer,
@@ -720,7 +720,7 @@ fn set_error_ctx(command: &RenderCommand, err_ctx: &mut RenderBundleErrorCtx) {
         | RenderCommand::SetStencilReference(_)
         | RenderCommand::SetViewport { .. }
         | RenderCommand::SetScissor(_) => RenderBundleError::Inner,
-    };
+    }
 }
 
 impl<G: GlobalIdentityHandlerFactory> Global<G> {
@@ -774,7 +774,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             let mut pipeline_layout_id = None::<id::Valid<id::PipelineLayoutId>>;
 
             for &command in base.commands {
-                set_error_ctx(&command, err_ctx);
+                *err_ctx = error_context(&command);
                 match command {
                     RenderCommand::SetBindGroup {
                         index,

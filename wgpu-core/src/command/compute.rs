@@ -163,8 +163,8 @@ pub enum ComputePassError {
 
 type ComputePassErrorCtx = fn(ComputePassErrorInner) -> ComputePassError;
 
-fn set_error_ctx(command: &ComputeCommand, err_ctx: &mut ComputePassErrorCtx) {
-    *err_ctx = match *command {
+fn error_context(command: &ComputeCommand) -> ComputePassErrorCtx {
+    match *command {
         ComputeCommand::SetBindGroup { .. } => ComputePassError::SetBindGroup,
         ComputeCommand::SetPipeline(_) => ComputePassError::SetPipeline,
         ComputeCommand::SetPushConstant { .. } => ComputePassError::SetPushConstant,
@@ -173,7 +173,7 @@ fn set_error_ctx(command: &ComputeCommand, err_ctx: &mut ComputePassErrorCtx) {
         ComputeCommand::PushDebugGroup { .. }
         | ComputeCommand::PopDebugGroup
         | ComputeCommand::InsertDebugMarker { .. } => ComputePassError::Inner,
-    };
+    }
 }
 
 #[derive(Debug)]
@@ -286,7 +286,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let mut temp_offsets = Vec::new();
 
         for command in base.commands {
-            set_error_ctx(&command, err_ctx);
+            *err_ctx = error_context(command);
             match *command {
                 ComputeCommand::SetBindGroup {
                     index,

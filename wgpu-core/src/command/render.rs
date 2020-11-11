@@ -430,8 +430,8 @@ pub enum RenderPassError {
 
 type RenderPassErrorCtx = fn(RenderPassErrorInner) -> RenderPassError;
 
-fn set_error_ctx(command: &RenderCommand, err_ctx: &mut RenderPassErrorCtx) {
-    *err_ctx = match *command {
+fn error_context(command: &RenderCommand) -> RenderPassErrorCtx {
+    match *command {
         RenderCommand::SetBindGroup { .. } => RenderPassError::SetBindGroup,
         RenderCommand::SetPipeline(_) => RenderPassError::SetPipeline,
         RenderCommand::SetIndexBuffer { .. } => RenderPassError::SetIndexBuffer,
@@ -455,7 +455,7 @@ fn set_error_ctx(command: &RenderCommand, err_ctx: &mut RenderPassErrorCtx) {
         RenderCommand::PushDebugGroup { .. }
         | RenderCommand::PopDebugGroup
         | RenderCommand::InsertDebugMarker { .. } => RenderPassError::Inner,
-    };
+    }
 }
 
 fn check_device_features(
@@ -1047,7 +1047,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let mut temp_offsets = Vec::new();
 
         for command in base.commands {
-            set_error_ctx(command, err_ctx);
+            *err_ctx = error_context(command);
             match *command {
                 RenderCommand::SetBindGroup {
                     index,

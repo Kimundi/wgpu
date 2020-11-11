@@ -143,37 +143,44 @@ pub enum ComputePassErrorInner {
     PushConstants(#[from] PushConstantUploadError),
 }
 
-/// Error encountered when performing a compute pass.
-#[derive(Clone, Debug, Error)]
-pub enum ComputePassError {
-    #[error(transparent)]
-    Inner(#[from] ComputePassErrorInner),
-
-    #[error("In a set_bind_group command")]
-    SetBindGroup(#[source] ComputePassErrorInner),
-    #[error("In a set_pipeline command")]
-    SetPipeline(#[source] ComputePassErrorInner),
-    #[error("In a set_push_constant command")]
-    SetPushConstant(#[source] ComputePassErrorInner),
-    #[error("In a dispatch command")]
-    Dispatch(#[source] ComputePassErrorInner),
-    #[error("In a indirect dispatch command")]
-    DispatchIndirect(#[source] ComputePassErrorInner),
-}
-
-type ComputePassErrorCtx = fn(ComputePassErrorInner) -> ComputePassError;
-
-fn error_context(command: &ComputeCommand) -> ComputePassErrorCtx {
-    match *command {
-        ComputeCommand::SetBindGroup { .. } => ComputePassError::SetBindGroup,
-        ComputeCommand::SetPipeline(_) => ComputePassError::SetPipeline,
-        ComputeCommand::SetPushConstant { .. } => ComputePassError::SetPushConstant,
-        ComputeCommand::Dispatch(_) => ComputePassError::Dispatch,
-        ComputeCommand::DispatchIndirect { .. } => ComputePassError::DispatchIndirect,
+fn error_context(command: ComputeCommand) -> ComputePassCommandError {
+    match command {
+        ComputeCommand::SetBindGroup { .. } => ComputePassCommandError::SetBindGroup,
+        ComputeCommand::SetPipeline(_) => ComputePassCommandError::SetPipeline,
+        ComputeCommand::SetPushConstant { .. } => ComputePassCommandError::SetPushConstant,
+        ComputeCommand::Dispatch(_) => ComputePassCommandError::Dispatch,
+        ComputeCommand::DispatchIndirect { .. } => ComputePassCommandError::DispatchIndirect,
         ComputeCommand::PushDebugGroup { .. }
         | ComputeCommand::PopDebugGroup
-        | ComputeCommand::InsertDebugMarker { .. } => ComputePassError::Inner,
+        | ComputeCommand::InsertDebugMarker { .. } => ComputePassCommandError::Debug,
     }
+}
+
+/// Error encountered when performing a compute pass.
+#[derive(Clone, Debug, Error)]
+#[error("{command}")]
+pub struct ComputePassError {
+    command: ComputePassCommandError,
+    #[source]
+    inner: ComputePassErrorInner,
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum ComputePassCommandError {
+    #[error("In the pass parameters")]
+    Pass,
+    #[error("In a set_bind_group command")]
+    SetBindGroup,
+    #[error("In a set_pipeline command")]
+    SetPipeline,
+    #[error("In a set_push_constant command")]
+    SetPushConstant,
+    #[error("In a dispatch command")]
+    Dispatch,
+    #[error("In a indirect dispatch command")]
+    DispatchIndirect,
+    #[error("In a debug command")]
+    Debug,
 }
 
 #[derive(Debug)]
@@ -244,16 +251,16 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         encoder_id: id::CommandEncoderId,
         base: BasePassRef<ComputeCommand>,
     ) -> Result<(), ComputePassError> {
-        let mut err_ctx: ComputePassErrorCtx = ComputePassError::Inner;
-        self.command_encoder_run_compute_pass_impl_inner::<B>(encoder_id, base, &mut err_ctx)
-            .map_err(|e| err_ctx(e))
+        let mut command: ComputePassCommandError = ComputePassCommandError::Pass;
+        self.command_encoder_run_compute_pass_impl_inner::<B>(encoder_id, base, &mut command)
+            .map_err(|inner| ComputePassError { command, inner })
     }
 
     fn command_encoder_run_compute_pass_impl_inner<B: GfxBackend>(
         &self,
         encoder_id: id::CommandEncoderId,
         mut base: BasePassRef<ComputeCommand>,
-        err_ctx: &mut ComputePassErrorCtx,
+        err_ctx: &mut ComputePassCommandError,
     ) -> Result<(), ComputePassErrorInner> {
         span!(_guard, INFO, "CommandEncoder::run_compute_pass");
         let hub = B::hub(self);
@@ -286,7 +293,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let mut temp_offsets = Vec::new();
 
         for command in base.commands {
-            *err_ctx = error_context(command);
+            *err_ctx = error_context(*command);
             match *command {
                 ComputeCommand::SetBindGroup {
                     index,
@@ -504,7 +511,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             }
         }
 
-        *err_ctx = ComputePassError::Inner;
+        *err_ctx = ComputePassCommandError::Pass;
 
         Ok(())
     }

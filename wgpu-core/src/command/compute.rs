@@ -143,44 +143,37 @@ pub enum ComputePassErrorInner {
     PushConstants(#[from] PushConstantUploadError),
 }
 
-fn error_context(command: ComputeCommand) -> ComputePassCommandError {
-    match command {
-        ComputeCommand::SetBindGroup { .. } => ComputePassCommandError::SetBindGroup,
-        ComputeCommand::SetPipeline(_) => ComputePassCommandError::SetPipeline,
-        ComputeCommand::SetPushConstant { .. } => ComputePassCommandError::SetPushConstant,
-        ComputeCommand::Dispatch(_) => ComputePassCommandError::Dispatch,
-        ComputeCommand::DispatchIndirect { .. } => ComputePassCommandError::DispatchIndirect,
+type ComputePassCommandError = Option<&'static str>;
+
+fn error_context(command: &ComputeCommand) -> ComputePassCommandError {
+    Some(match command {
+        ComputeCommand::SetBindGroup { .. } => "In a set_bind_group command",
+        ComputeCommand::SetPipeline(_) => "In a set_pipeline command",
+        ComputeCommand::SetPushConstant { .. } => "In a set_push_constant command",
+        ComputeCommand::Dispatch(_) => "In a dispatch command",
+        ComputeCommand::DispatchIndirect { .. } => "In a indirect dispatch command",
         ComputeCommand::PushDebugGroup { .. }
         | ComputeCommand::PopDebugGroup
-        | ComputeCommand::InsertDebugMarker { .. } => ComputePassCommandError::Debug,
-    }
+        | ComputeCommand::InsertDebugMarker { .. } => "In a debug command",
+    })
 }
 
 /// Error encountered when performing a compute pass.
 #[derive(Clone, Debug, Error)]
 #[error("{command}")]
 pub struct ComputePassError {
-    command: ComputePassCommandError,
+    command: &'static str,
     #[source]
     inner: ComputePassErrorInner,
 }
 
-#[derive(Clone, Debug, Error)]
-pub enum ComputePassCommandError {
-    #[error("In the pass parameters")]
-    Pass,
-    #[error("In a set_bind_group command")]
-    SetBindGroup,
-    #[error("In a set_pipeline command")]
-    SetPipeline,
-    #[error("In a set_push_constant command")]
-    SetPushConstant,
-    #[error("In a dispatch command")]
-    Dispatch,
-    #[error("In a indirect dispatch command")]
-    DispatchIndirect,
-    #[error("In a debug command")]
-    Debug,
+impl ComputePassError {
+    fn new(command: ComputePassCommandError, inner: ComputePassErrorInner) -> Self {
+        ComputePassError {
+            command: command.unwrap_or("In the pass parameters"),
+            inner,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -251,9 +244,9 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         encoder_id: id::CommandEncoderId,
         base: BasePassRef<ComputeCommand>,
     ) -> Result<(), ComputePassError> {
-        let mut command: ComputePassCommandError = ComputePassCommandError::Pass;
+        let mut command: ComputePassCommandError = None;
         self.command_encoder_run_compute_pass_impl_inner::<B>(encoder_id, base, &mut command)
-            .map_err(|inner| ComputePassError { command, inner })
+            .map_err(|inner| ComputePassError::new(command, inner))
     }
 
     fn command_encoder_run_compute_pass_impl_inner<B: GfxBackend>(
@@ -293,7 +286,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         let mut temp_offsets = Vec::new();
 
         for command in base.commands {
-            *err_ctx = error_context(*command);
+            *err_ctx = error_context(command);
             match *command {
                 ComputeCommand::SetBindGroup {
                     index,
@@ -511,7 +504,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             }
         }
 
-        *err_ctx = ComputePassCommandError::Pass;
+        *err_ctx = None;
 
         Ok(())
     }

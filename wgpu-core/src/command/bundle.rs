@@ -38,7 +38,9 @@
 #![allow(clippy::reversed_empty_ranges)]
 
 use crate::{
-    command::{BasePass, DrawError, RenderCommand, RenderCommandError, StateChange},
+    command::{
+        render::error_context, BasePass, DrawError, RenderCommand, RenderCommandError, StateChange,
+    },
     conv,
     device::{
         AttachmentData, DeviceError, RenderPassContext, MAX_VERTEX_BUFFERS, SHADER_STAGE_COUNT,
@@ -667,59 +669,23 @@ pub enum RenderBundleErrorInner {
     Draw(#[from] DrawError),
 }
 
-/// Error encountered when performing a render pass.
-#[derive(Clone, Debug, Error)]
-pub enum RenderBundleError {
-    #[error(transparent)]
-    Inner(#[from] RenderBundleErrorInner),
+type RenderBundleCommandError = Option<&'static str>;
 
-    #[error("In a set_bind_group command")]
-    SetBindGroup(#[source] RenderBundleErrorInner),
-    #[error("In a set_pipeline command")]
-    SetPipeline(#[source] RenderBundleErrorInner),
-    #[error("In a set_index_buffer command")]
-    SetIndexBuffer(#[source] RenderBundleErrorInner),
-    #[error("In a set_vertex_buffer command")]
-    SetVertexBuffer(#[source] RenderBundleErrorInner),
-    #[error("In a set_push_constant command")]
-    SetPushConstant(#[source] RenderBundleErrorInner),
-    #[error("In a draw command")]
-    Draw(#[source] RenderBundleErrorInner),
-    #[error("In a indexed draw command")]
-    DrawIndexed(#[source] RenderBundleErrorInner),
-    #[error("In a indirect draw command")]
-    DrawIndirect(#[source] RenderBundleErrorInner),
-    #[error("In a indexed indirect draw command")]
-    DrawIndexedIndirect(#[source] RenderBundleErrorInner),
+/// Error encountered when finishing recording a render bundle.
+#[derive(Clone, Debug, Error)]
+#[error("{command}")]
+pub struct RenderBundleError {
+    command: &'static str,
+    #[source]
+    inner: RenderBundleErrorInner,
 }
 
-type RenderBundleErrorCtx = fn(RenderBundleErrorInner) -> RenderBundleError;
-
-fn error_context(command: &RenderCommand) -> RenderBundleErrorCtx {
-    match *command {
-        RenderCommand::SetBindGroup { .. } => RenderBundleError::SetBindGroup,
-        RenderCommand::SetPipeline(_) => RenderBundleError::SetPipeline,
-        RenderCommand::SetIndexBuffer { .. } => RenderBundleError::SetIndexBuffer,
-        RenderCommand::SetVertexBuffer { .. } => RenderBundleError::SetVertexBuffer,
-        RenderCommand::SetPushConstant { .. } => RenderBundleError::SetPushConstant,
-        RenderCommand::Draw { .. } => RenderBundleError::Draw,
-        RenderCommand::DrawIndexed { .. } => RenderBundleError::DrawIndexed,
-        RenderCommand::MultiDrawIndirect { indexed: true, .. }
-        | RenderCommand::MultiDrawIndirectCount { indexed: true, .. } => {
-            RenderBundleError::DrawIndexedIndirect
+impl RenderBundleError {
+    fn new(command: RenderBundleCommandError, inner: RenderBundleErrorInner) -> Self {
+        RenderBundleError {
+            command: command.unwrap_or("In the bundle parameters"),
+            inner,
         }
-        RenderCommand::MultiDrawIndirect { indexed: false, .. }
-        | RenderCommand::MultiDrawIndirectCount { indexed: false, .. } => {
-            RenderBundleError::DrawIndirect
-        }
-        RenderCommand::PushDebugGroup { .. }
-        | RenderCommand::PopDebugGroup
-        | RenderCommand::InsertDebugMarker { .. }
-        | RenderCommand::ExecuteBundle(_)
-        | RenderCommand::SetBlendColor(_)
-        | RenderCommand::SetStencilReference(_)
-        | RenderCommand::SetViewport { .. }
-        | RenderCommand::SetScissor(_) => RenderBundleError::Inner,
     }
 }
 
@@ -730,9 +696,9 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         desc: &RenderBundleDescriptor,
         id_in: Input<G, id::RenderBundleId>,
     ) -> Result<id::RenderBundleId, RenderBundleError> {
-        let mut err_ctx: RenderBundleErrorCtx = RenderBundleError::Inner;
-        self.render_bundle_encoder_finish_inner::<B>(bundle_encoder, desc, id_in, &mut err_ctx)
-            .map_err(|e| err_ctx(e))
+        let mut command: RenderBundleCommandError = None;
+        self.render_bundle_encoder_finish_inner::<B>(bundle_encoder, desc, id_in, &mut command)
+            .map_err(|inner| RenderBundleError::new(command, inner))
     }
 
     fn render_bundle_encoder_finish_inner<B: GfxBackend>(
@@ -740,7 +706,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         bundle_encoder: RenderBundleEncoder,
         desc: &RenderBundleDescriptor,
         id_in: Input<G, id::RenderBundleId>,
-        err_ctx: &mut RenderBundleErrorCtx,
+        err_ctx: &mut RenderBundleCommandError,
     ) -> Result<id::RenderBundleId, RenderBundleErrorInner> {
         span!(_guard, INFO, "RenderBundleEncoder::finish");
         let hub = B::hub(self);
@@ -1011,7 +977,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
                 }
             }
 
-            *err_ctx = RenderBundleError::Inner;
+            *err_ctx = None;
 
             tracing::debug!("Render bundle {:?} = {:#?}", id_in, state.trackers);
             let _ = desc.label; //TODO: actually use

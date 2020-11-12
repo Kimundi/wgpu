@@ -392,69 +392,51 @@ impl From<MissingTextureUsageError> for RenderPassErrorInner {
     }
 }
 
-/// Error encountered when performing a render pass.
-#[derive(Clone, Debug, Error)]
-pub enum RenderPassError {
-    #[error(transparent)]
-    Inner(#[from] RenderPassErrorInner),
+type RenderPassCommandError = Option<&'static str>;
 
-    #[error("In a set_bind_group command")]
-    SetBindGroup(#[source] RenderPassErrorInner),
-    #[error("In a set_pipeline command")]
-    SetPipeline(#[source] RenderPassErrorInner),
-    #[error("In a set_index_buffer command")]
-    SetIndexBuffer(#[source] RenderPassErrorInner),
-    #[error("In a set_vertex_buffer command")]
-    SetVertexBuffer(#[source] RenderPassErrorInner),
-    #[error("In a set_blend_color command")]
-    SetBlendColor(#[source] RenderPassErrorInner),
-    #[error("In a set_stencil_reference command")]
-    SetStencilReference(#[source] RenderPassErrorInner),
-    #[error("In a set_viewport command")]
-    SetViewport(#[source] RenderPassErrorInner),
-    #[error("In a set_push_constant command")]
-    SetPushConstant(#[source] RenderPassErrorInner),
-    #[error("In a set_scissor_rect command")]
-    SetScissor(#[source] RenderPassErrorInner),
-    #[error("In a draw command")]
-    Draw(#[source] RenderPassErrorInner),
-    #[error("In a indexed draw command")]
-    DrawIndexed(#[source] RenderPassErrorInner),
-    #[error("In a indirect draw command")]
-    DrawIndirect(#[source] RenderPassErrorInner),
-    #[error("In a indexed indirect draw command")]
-    DrawIndexedIndirect(#[source] RenderPassErrorInner),
-    #[error("In a execute_bundle command")]
-    ExecuteBundle(#[source] RenderPassErrorInner),
-}
-
-type RenderPassErrorCtx = fn(RenderPassErrorInner) -> RenderPassError;
-
-fn error_context(command: &RenderCommand) -> RenderPassErrorCtx {
-    match *command {
-        RenderCommand::SetBindGroup { .. } => RenderPassError::SetBindGroup,
-        RenderCommand::SetPipeline(_) => RenderPassError::SetPipeline,
-        RenderCommand::SetIndexBuffer { .. } => RenderPassError::SetIndexBuffer,
-        RenderCommand::SetVertexBuffer { .. } => RenderPassError::SetVertexBuffer,
-        RenderCommand::SetBlendColor(_) => RenderPassError::SetBlendColor,
-        RenderCommand::SetStencilReference(_) => RenderPassError::SetStencilReference,
-        RenderCommand::SetViewport { .. } => RenderPassError::SetViewport,
-        RenderCommand::SetScissor(_) => RenderPassError::SetScissor,
-        RenderCommand::SetPushConstant { .. } => RenderPassError::SetPushConstant,
-        RenderCommand::Draw { .. } => RenderPassError::Draw,
-        RenderCommand::DrawIndexed { .. } => RenderPassError::DrawIndexed,
+pub(super) fn error_context(command: &RenderCommand) -> RenderPassCommandError {
+    Some(match command {
+        RenderCommand::SetBindGroup { .. } => "In a set_bind_group command",
+        RenderCommand::SetPipeline(_) => "In a set_pipeline command",
+        RenderCommand::SetIndexBuffer { .. } => "In a set_index_buffer command",
+        RenderCommand::SetVertexBuffer { .. } => "In a set_vertex_buffer command",
+        RenderCommand::SetBlendColor(_) => "In a set_blend_color command",
+        RenderCommand::SetStencilReference(_) => "In a set_stencil_reference command",
+        RenderCommand::SetViewport { .. } => "In a set_viewport command",
+        RenderCommand::SetScissor(_) => "In a set_push_constant command",
+        RenderCommand::SetPushConstant { .. } => "In a set_scissor_rect command",
+        RenderCommand::Draw { .. } => "In a draw command",
+        RenderCommand::DrawIndexed { .. } => "In a indexed draw command",
         RenderCommand::MultiDrawIndirect { indexed: false, .. }
         | RenderCommand::MultiDrawIndirectCount { indexed: false, .. } => {
-            RenderPassError::DrawIndirect
+            "In a indirect draw command"
         }
         RenderCommand::MultiDrawIndirect { indexed: true, .. }
         | RenderCommand::MultiDrawIndirectCount { indexed: true, .. } => {
-            RenderPassError::DrawIndexedIndirect
+            "In a indexed indirect draw command"
         }
-        RenderCommand::ExecuteBundle(_) => RenderPassError::ExecuteBundle,
+        RenderCommand::ExecuteBundle(_) => "In a execute_bundle command",
         RenderCommand::PushDebugGroup { .. }
         | RenderCommand::PopDebugGroup
-        | RenderCommand::InsertDebugMarker { .. } => RenderPassError::Inner,
+        | RenderCommand::InsertDebugMarker { .. } => "In a debug command",
+    })
+}
+
+/// Error encountered when performing a render pass.
+#[derive(Clone, Debug, Error)]
+#[error("{command}")]
+pub struct RenderPassError {
+    command: &'static str,
+    #[source]
+    inner: RenderPassErrorInner,
+}
+
+impl RenderPassError {
+    fn new(command: RenderPassCommandError, inner: RenderPassErrorInner) -> Self {
+        RenderPassError {
+            command: command.unwrap_or("In the pass parameters"),
+            inner,
+        }
     }
 }
 
@@ -493,15 +475,15 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         color_attachments: &[ColorAttachmentDescriptor],
         depth_stencil_attachment: Option<&DepthStencilAttachmentDescriptor>,
     ) -> Result<(), RenderPassError> {
-        let mut err_ctx: RenderPassErrorCtx = RenderPassError::Inner;
+        let mut command: RenderPassCommandError = None;
         self.command_encoder_run_render_pass_impl_inner::<B>(
             encoder_id,
             base,
             color_attachments,
             depth_stencil_attachment,
-            &mut err_ctx,
+            &mut command,
         )
-        .map_err(|e| err_ctx(e))
+        .map_err(|inner| RenderPassError::new(command, inner))
     }
 
     fn command_encoder_run_render_pass_impl_inner<B: GfxBackend>(
@@ -510,7 +492,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
         mut base: BasePassRef<RenderCommand>,
         color_attachments: &[ColorAttachmentDescriptor],
         depth_stencil_attachment: Option<&DepthStencilAttachmentDescriptor>,
-        err_ctx: &mut RenderPassErrorCtx,
+        err_ctx: &mut RenderPassCommandError,
     ) -> Result<(), RenderPassErrorInner> {
         span!(_guard, INFO, "CommandEncoder::run_render_pass");
 
@@ -1668,7 +1650,7 @@ impl<G: GlobalIdentityHandlerFactory> Global<G> {
             }
         }
 
-        *err_ctx = RenderPassError::Inner;
+        *err_ctx = None;
 
         tracing::trace!("Merging {:?} with the render pass", encoder_id);
         unsafe {
